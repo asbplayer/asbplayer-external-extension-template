@@ -1,0 +1,5 @@
+# This project is a standalone workspace (see README - it is intentionally excluded from the
+# parent workspace) so its installs and lockfile stay self-contained.
+allowBuilds:
+  '@parcel/watcher': false
+  keccak: false
