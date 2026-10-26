@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: Unlicense
 
-import type { ExternalApprovalMessage, ExternalCommand, Response } from './protocol';
+import type {
+    ExternalMethod,
+    JsonRpcNotification,
+    JsonRpcRequest,
+    JsonRpcResponse,
+    MethodParams,
+    MethodResults,
+} from './protocol';
 
 /**
- * Request/response correlation over an external connection port, by `messageId` -- the same
- * scheme the WebSocket server integration uses. Frames that receive no response (unapproved
- * extensions, unhandled commands) reject after a timeout, like the WebSocket server's
- * RequestTimeout.
+ * Request/response correlation over an external connection port, by JSON-RPC `id`. Every request
+ * is answered with a result or an error, so a timeout means the connection or asbplayer is not
+ * responding -- not that the request is waiting for human approval.
  */
 export class ExternalConnection {
     private readonly _port: chrome.runtime.Port;
-    private readonly _requests = new Map<string, (response: Response<unknown> | undefined) => void>();
+    private readonly _requests = new Map<string, (response: JsonRpcResponse<unknown> | undefined) => void>();
     private readonly _messageListeners: ((message: unknown) => void)[] = [];
     private readonly _disconnectListeners: (() => void)[] = [];
     private _disconnected = false;
@@ -45,45 +51,56 @@ export class ExternalConnection {
         this._onDisconnect();
     }
 
-    /** Posts a raw frame without expecting a response. */
-    post(message: unknown) {
-        this._port.postMessage(message);
+    /** Posts a notification: no `id`, and no response is expected. */
+    post(notification: JsonRpcNotification) {
+        this._port.postMessage(notification);
     }
 
     /**
-     * Posts a command and correlates the response by message ID. Resolves `undefined` on
-     * timeout or disconnect; rejects if the post itself fails.
+     * Sends a JSON-RPC request and correlates the response by id. Resolves `undefined` on timeout
+     * or disconnect; rejects if the post itself fails. Errors from asbplayer are returned as an
+     * `error` response rather than thrown.
      */
-    async request<T>(command: ExternalCommand): Promise<Response<T> | undefined> {
-        return new Promise<Response<T> | undefined>((resolve, reject) => {
+    async request<M extends ExternalMethod>(
+        method: M,
+        params: MethodParams[M]
+    ): Promise<JsonRpcResponse<MethodResults[M]> | undefined> {
+        const id = crypto.randomUUID();
+
+        return new Promise<JsonRpcResponse<MethodResults[M]> | undefined>((resolve, reject) => {
             const timeout = setTimeout(() => {
-                this._requests.delete(command.messageId);
+                this._requests.delete(id);
                 resolve(undefined);
             }, this._timeoutMs);
 
-            this._requests.set(command.messageId, (response) => {
+            this._requests.set(id, (response) => {
                 clearTimeout(timeout);
-                resolve(response as Response<T> | undefined);
+                resolve(response as JsonRpcResponse<MethodResults[M]> | undefined);
             });
 
+            const request: JsonRpcRequest<MethodParams[M]> = { jsonrpc: '2.0', id, method, params };
+
             try {
-                this._port.postMessage(command);
+                this._port.postMessage(request);
             } catch (error) {
                 clearTimeout(timeout);
-                this._requests.delete(command.messageId);
+                this._requests.delete(id);
                 reject(error);
             }
         });
     }
 
     private _onMessage(message: unknown) {
-        const response = message as Response<unknown> | undefined;
+        const response = message as { jsonrpc?: unknown; id?: unknown } | undefined;
 
-        if (response?.command === 'response' && this._requests.has(response.messageId)) {
-            const resolve = this._requests.get(response.messageId)!;
-            this._requests.delete(response.messageId);
-            resolve(response);
-            return;
+        if (response?.jsonrpc === '2.0' && typeof response.id === 'string') {
+            const resolve = this._requests.get(response.id);
+
+            if (resolve !== undefined) {
+                this._requests.delete(response.id);
+                resolve(message as JsonRpcResponse<unknown>);
+                return;
+            }
         }
 
         for (const listener of this._messageListeners) {
@@ -106,25 +123,6 @@ export class ExternalConnection {
 
         for (const listener of this._disconnectListeners) {
             listener();
-        }
-    }
-}
-
-export class ExternalApproval {
-    private _approved = false;
-
-    constructor(private readonly _onChanged: (approved: boolean) => void) {}
-
-    get approved() {
-        return this._approved;
-    }
-
-    update(message: ExternalApprovalMessage) {
-        const approved = message.approved === true;
-
-        if (approved !== this._approved) {
-            this._approved = approved;
-            this._onChanged(approved);
         }
     }
 }

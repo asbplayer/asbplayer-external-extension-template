@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Unlicense
 
-import { ExternalApproval, ExternalConnection } from './connection';
+import { ExternalConnection } from './connection';
 import type {
+    ApprovalState,
     BoundMedia,
-    ExternalApprovalMessage,
-    ExternalCommand,
-    ExternalHelloMessage,
-    GetBoundMediaResponseBody,
-    GetSubtitlesResponseBody,
+    ExternalMethod,
+    JsonRpcError,
+    JsonRpcResponse,
+    MethodParams,
+    MethodResults,
 } from './protocol';
 import { PostMineAction, portName } from './protocol';
 
@@ -25,17 +26,18 @@ const disconnectButton = document.querySelector<HTMLButtonElement>('#disconnect'
 const statusSpan = document.querySelector<HTMLSpanElement>('#status')!;
 const logDiv = document.querySelector<HTMLDivElement>('#log')!;
 
-const helloButton = document.querySelector<HTMLButtonElement>('#hello')!;
+const initializeButton = document.querySelector<HTMLButtonElement>('#initialize')!;
 const getBoundMediaButton = document.querySelector<HTMLButtonElement>('#get-bound-media')!;
 const mineSubtitleButton = document.querySelector<HTMLButtonElement>('#mine-subtitle')!;
 const seekButton = document.querySelector<HTMLButtonElement>('#seek-timestamp')!;
 const loadSubtitlesButton = document.querySelector<HTMLButtonElement>('#load-subtitles')!;
 const getSubtitlesButton = document.querySelector<HTMLButtonElement>('#get-subtitles')!;
 
+const commandButtons = [getBoundMediaButton, mineSubtitleButton, seekButton, loadSubtitlesButton, getSubtitlesButton];
+
 let connection: ExternalConnection | undefined;
-let approval = new ExternalApproval((approved) => setStatus());
+let approvalState: ApprovalState = 'pending';
 let polling: ReturnType<typeof setInterval> | undefined;
-let awaitingApprovalLogged = false;
 let lastMedia: BoundMedia | undefined;
 
 function log(message: string) {
@@ -45,57 +47,177 @@ function log(message: string) {
 }
 
 function setStatus() {
-    statusSpan.textContent =
-        connection === undefined ? 'Not connected' : approval.approved ? 'Approved' : 'Awaiting approval...';
+    if (connection === undefined) {
+        statusSpan.textContent = 'Not connected';
+    } else if (approvalState === 'approved') {
+        statusSpan.textContent = 'Approved';
+    } else if (approvalState === 'denied') {
+        statusSpan.textContent = 'Denied';
+    } else {
+        statusSpan.textContent = 'Awaiting approval...';
+    }
 
-    for (const button of [
-        getBoundMediaButton,
-        mineSubtitleButton,
-        seekButton,
-        loadSubtitlesButton,
-        getSubtitlesButton,
-    ]) {
-        button.disabled = connection === undefined;
+    for (const button of commandButtons) {
+        button.disabled = connection === undefined || approvalState !== 'approved';
     }
 }
 
-async function request<T>(command: ExternalCommand): Promise<void> {
-    if (connection === undefined) {
-        return;
-    }
-
-    const response = await connection.request<T>(command);
-
-    if (response === undefined) {
-        log(`<no response: ${command.messageId}>`);
-        return;
-    }
-
-    log(`${JSON.stringify(response.body)}`);
+function formatError(error: JsonRpcError) {
+    return error.data === undefined
+        ? `${error.message} (${error.code})`
+        : `${error.message} (${error.code}): ${JSON.stringify(error.data)}`;
 }
 
-async function getBoundMedia(): Promise<GetBoundMediaResponseBody | undefined> {
-    if (connection === undefined) {
-        return undefined;
+function applyApprovalState(state: ApprovalState) {
+    const previous = approvalState;
+    approvalState = state;
+    setStatus();
+
+    if (state === 'approved') {
+        stopPolling();
+
+        if (previous !== 'approved') {
+            log('Approved! Commands are now dispatched.');
+            void getBoundMedia().then((media) => {
+                if (media !== undefined) {
+                    log('Dispatch verified.');
+                }
+            });
+        }
+
+        return;
     }
 
-    const response = await connection.request<GetBoundMediaResponseBody>({
-        command: 'get-bound-media',
-        messageId: newId(),
-        body: {},
+    if (state === 'denied') {
+        stopPolling();
+
+        if (previous !== 'denied') {
+            log('Approval was denied. asbplayer closed the connection.');
+        }
+
+        return;
+    }
+
+    startPolling();
+}
+
+async function sendInitialize() {
+    const active = connection;
+
+    if (active === undefined) {
+        return;
+    }
+
+    const response = await active.request('initialize', {
+        name: selfName,
+        version: chrome.runtime.getManifest().version,
     });
 
+    if (active !== connection) {
+        return;
+    }
+
     if (response === undefined) {
+        log('<no response: initialize>');
+        return;
+    }
+
+    if ('error' in response) {
+        log(`initialize failed: ${formatError(response.error)}`);
+        return;
+    }
+
+    applyApprovalState(response.result.state);
+}
+
+async function pollApprovalState() {
+    const active = connection;
+
+    if (active === undefined || active.disconnected) {
+        stopPolling();
+        return;
+    }
+
+    const response = await active.request('approval-state', {});
+
+    if (active !== connection) {
+        return;
+    }
+
+    if (response === undefined) {
+        log('<no response: approval-state>');
+        return;
+    }
+
+    if ('error' in response) {
+        log(`approval-state failed: ${formatError(response.error)}`);
+        return;
+    }
+
+    applyApprovalState(response.result.state);
+}
+
+function startPolling() {
+    if (polling !== undefined || connection === undefined) {
+        return;
+    }
+
+    polling = setInterval(() => void pollApprovalState(), 1000);
+}
+
+function stopPolling() {
+    if (polling !== undefined) {
+        clearInterval(polling);
+        polling = undefined;
+    }
+}
+
+async function sendRequest<M extends ExternalMethod>(
+    method: M,
+    params: MethodParams[M]
+): Promise<MethodResults[M] | undefined> {
+    const active = connection;
+
+    if (active === undefined) {
         return undefined;
     }
 
-    lastMedia = response.body.media[0];
-    log(JSON.stringify(response.body));
-    return response.body;
+    let response: JsonRpcResponse<unknown> | undefined;
+
+    try {
+        response = await active.request(method, params);
+    } catch (error) {
+        log(`${method} failed to send: ${error instanceof Error ? error.message : String(error)}`);
+        return undefined;
+    }
+
+    if (active !== connection) {
+        return undefined;
+    }
+
+    if (response === undefined) {
+        log(`<no response: ${method}>`);
+        return undefined;
+    }
+
+    if ('error' in response) {
+        log(`${method} failed: ${formatError(response.error)}`);
+        return undefined;
+    }
+
+    return response.result as MethodResults[M];
 }
 
-function newId() {
-    return `msg-${Date.now()}-${Math.floor(Math.random() * 100000)}`;
+async function getBoundMedia() {
+    const result = await sendRequest('get-bound-media', {});
+
+    if (result === undefined) {
+        return undefined;
+    }
+
+    lastMedia = result.media[0];
+    log(JSON.stringify(result));
+    return result;
 }
 
 function connect() {
@@ -119,19 +241,8 @@ function connect() {
 
     connection = new ExternalConnection(port);
     const newConnection = connection;
-    awaitingApprovalLogged = false;
-    approval = new ExternalApproval((approved) => {
-        setStatus();
-        awaitingApprovalLogged = false;
-        log(approved ? 'Approved! Commands are now dispatched.' : 'Approval was removed or denied.');
-        stopPolling();
-        startPolling();
-    });
-    connection.onMessage((message) => {
-        if ((message as { type?: string }).type === 'asbplayer-external-approval') {
-            approval.update(message as ExternalApprovalMessage);
-        }
-    });
+    approvalState = 'pending';
+
     connection.onDisconnect(() => {
         // A reconnect replaces the connection before the old port's disconnect event fires.
         if (connection !== newConnection) {
@@ -142,57 +253,17 @@ function connect() {
         teardown();
     });
 
-    // Greet asbplayer; the response reflects the current approval state.
-    const hello: ExternalHelloMessage = {
-        type: 'asbplayer-external-hello',
-        name: selfName,
-        version: chrome.runtime.getManifest().version,
-    };
-    connection.post(hello);
-    log(`Said hello as "${selfName}" to extension ${asbplayerExtensionId}. Waiting for approval if needed...`);
-
+    // Greet asbplayer; the response reflects the current approval state. If pending, start
+    // polling `approval-state` until the user makes a decision.
+    log(`Sent initialize as "${selfName}" to extension ${asbplayerExtensionId}.`);
     connectButton.textContent = 'Reconnect';
     setStatus();
-    startPolling();
-}
-
-function startPolling() {
-    if (polling !== undefined || connection === undefined) {
-        return;
-    }
-
-    // While unapproved, commands receive no response, so retry get-bound-media periodically
-    // until approval arrives.
-    polling = setInterval(() => {
-        if (connection === undefined || connection.disconnected) {
-            stopPolling();
-            return;
-        }
-
-        if (approval.approved) {
-            stopPolling();
-            void getBoundMedia().then(() => log('Dispatch verified.'));
-            return;
-        }
-
-        void getBoundMedia().then((media) => {
-            if (media === undefined && polling !== undefined && !awaitingApprovalLogged) {
-                awaitingApprovalLogged = true;
-                log('(no response yet - still awaiting approval...)');
-            }
-        });
-    }, 2000);
-}
-
-function stopPolling() {
-    if (polling !== undefined) {
-        clearInterval(polling);
-        polling = undefined;
-    }
+    void sendInitialize();
 }
 
 function teardown() {
     connection = undefined;
+    approvalState = 'pending';
     stopPolling();
     setStatus();
 }
@@ -210,50 +281,34 @@ disconnectButton.addEventListener('click', () => {
     connection?.disconnect();
 });
 
-helloButton.addEventListener('click', () => {
-    connection?.post({
-        type: 'asbplayer-external-hello',
-        name: selfName,
-        version: chrome.runtime.getManifest().version,
-    } satisfies ExternalHelloMessage);
-    log('Re-sent hello frame.');
+initializeButton.addEventListener('click', () => {
+    log('Sending initialize...');
+    void sendInitialize();
 });
 
 getBoundMediaButton.addEventListener('click', () => void getBoundMedia());
 
 mineSubtitleButton.addEventListener('click', () => {
     log('Mining subtitle with sample fields...');
-    void request<{ published: boolean }>({
-        command: 'mine-subtitle',
-        messageId: newId(),
-        body: {
-            fields: { word: 'ねこ', sentence: 'ねこ' },
-            postMineAction: PostMineAction.showAnkiDialog,
-            ...(lastMedia !== undefined ? { mediaId: lastMedia.id } : {}),
-        },
+    void sendRequest('mine-subtitle', {
+        fields: { word: 'ねこ', sentence: 'ねこ' },
+        postMineAction: PostMineAction.showAnkiDialog,
+        ...(lastMedia !== undefined ? { mediaId: lastMedia.id } : {}),
     });
 });
 
 seekButton.addEventListener('click', () => {
-    void request({
-        command: 'seek-timestamp',
-        messageId: newId(),
-        body: {
-            timestamp: 30,
-            ...(lastMedia !== undefined ? { mediaId: lastMedia.id } : {}),
-        },
+    void sendRequest('seek-timestamp', {
+        timestamp: 30,
+        ...(lastMedia !== undefined ? { mediaId: lastMedia.id } : {}),
     });
     log('Requested seek to 30s.');
 });
 
 loadSubtitlesButton.addEventListener('click', () => {
-    void request({
-        command: 'load-subtitles',
-        messageId: newId(),
-        body: {
-            files: [{ base64: sampleSrtBase64, name: 'sample.srt' }],
-            ...(lastMedia !== undefined ? { mediaId: lastMedia.id } : {}),
-        },
+    void sendRequest('load-subtitles', {
+        files: [{ base64: sampleSrtBase64, name: 'sample.srt' }],
+        ...(lastMedia !== undefined ? { mediaId: lastMedia.id } : {}),
     });
     log('Requested load of sample.srt.');
 });
@@ -264,11 +319,7 @@ getSubtitlesButton.addEventListener('click', async () => {
         return;
     }
 
-    await request<GetSubtitlesResponseBody>({
-        command: 'get-subtitles',
-        messageId: newId(),
-        body: { mediaId: lastMedia.id },
-    });
+    await sendRequest('get-subtitles', { mediaId: lastMedia.id });
 });
 
 setStatus();

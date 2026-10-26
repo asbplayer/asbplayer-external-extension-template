@@ -3,73 +3,95 @@
 // Protocol types for asbplayer's external extension API, kept as a local copy so that an
 // external extension only needs this file and never asbplayer's packages.
 //
-// Frames travel over a browser.runtime.connect port named {@link portName}:
+// Frames travel over a browser.runtime.connect port named {@link portName} and use JSON-RPC 2.0.
+// One message per port message, no batches:
 //
 //   external extension -> asbplayer:
-//     { type: 'asbplayer-external-hello', name?, version? }
-//     { command: ExternalCommand['command'], messageId: string, body: object }
+//     { jsonrpc: '2.0', id, method: 'initialize', params: { name?, version? } }
+//     { jsonrpc: '2.0', id, method: 'approval-state', params: {} }
+//     { jsonrpc: '2.0', id, method: <command>, params: object }
 //   asbplayer -> external extension:
-//     { type: 'asbplayer-external-approval', approved: boolean }
-//     { command: 'response', messageId: string, body: object }
+//     { jsonrpc: '2.0', id, result: object } or { jsonrpc: '2.0', id, error: object }
 //
-// Commands are the same wire format the WebSocket server integration uses. Frames that
-// are not dispatched (unknown commands, unapproved extensions) receive no response, so
-// each request needs a timeout (see connection.ts).
+// `initialize` and `approval-state` are extension-only methods used for approval. Commands are the
+// same methods the WebSocket server integration accepts. A frame sent without an `id` is a
+// notification and is never answered.
 
 export const portName = 'asbplayer-external-v1';
 
-export interface ExternalHelloMessage {
-    readonly type: 'asbplayer-external-hello';
+export interface JsonRpcError {
+    readonly code: number;
+    readonly message: string;
+    readonly data?: unknown;
+}
+
+export interface JsonRpcRequest<TParams = unknown> {
+    readonly jsonrpc: '2.0';
+    readonly id: string;
+    readonly method: string;
+    readonly params?: TParams;
+}
+
+export interface JsonRpcNotification<TParams = unknown> {
+    readonly jsonrpc: '2.0';
+    readonly method: string;
+    readonly params?: TParams;
+}
+
+export interface JsonRpcSuccessResponse<TResult> {
+    readonly jsonrpc: '2.0';
+    readonly id: string;
+    readonly result: TResult;
+}
+
+export interface JsonRpcErrorResponse {
+    readonly jsonrpc: '2.0';
+    readonly id: string;
+    readonly error: JsonRpcError;
+}
+
+export type JsonRpcResponse<TResult> = JsonRpcSuccessResponse<TResult> | JsonRpcErrorResponse;
+
+export type ApprovalState = 'approved' | 'pending' | 'denied';
+
+// `initialize` returns immediately with the current state. If pending, poll `approval-state`.
+export interface InitializeParams {
     /** Self-reported, untrusted display name shown next to the extension ID in asbplayer's approval UI. */
     readonly name?: string;
     readonly version?: string;
 }
 
-export interface ExternalApprovalMessage {
-    readonly type: 'asbplayer-external-approval';
-    readonly approved: boolean;
+export interface InitializeResult {
+    readonly state: 'approved' | 'pending';
 }
 
-export interface Response<T> {
-    readonly command: 'response';
-    readonly messageId: string;
-    readonly body: T;
+export interface ApprovalStateResult {
+    readonly state: ApprovalState;
 }
 
-export interface MineSubtitleCommand {
-    readonly command: 'mine-subtitle';
-    readonly messageId: string;
-    readonly body: {
-        fields: { [key: string]: string };
-        postMineAction: number;
-        mediaId?: string;
-        noteId?: number;
-    };
+export interface MineSubtitleParams {
+    readonly fields: { [key: string]: string };
+    readonly postMineAction: number;
+    readonly mediaId?: string;
+    readonly noteId?: number;
 }
 
-export interface LoadSubtitlesCommand {
-    readonly command: 'load-subtitles';
-    readonly messageId: string;
-    readonly body: {
-        files?: { base64: string; name: string }[];
-        mediaId?: string;
-    };
+export interface MineSubtitleResult {
+    /** Whether the mining flow was accepted (dispatched), not whether a card was completed. */
+    readonly published: boolean;
 }
 
-export interface SeekTimestampCommand {
-    readonly command: 'seek-timestamp';
-    readonly messageId: string;
-    readonly body: {
-        timestamp: number;
-        mediaId?: string;
-    };
+export interface LoadSubtitlesParams {
+    readonly files?: { base64: string; name: string }[];
+    readonly mediaId?: string;
 }
 
-export interface GetBoundMediaCommand {
-    readonly command: 'get-bound-media';
-    readonly messageId: string;
-    readonly body: Record<string, never>;
+export interface SeekTimestampParams {
+    readonly timestamp: number;
+    readonly mediaId?: string;
 }
+
+export interface GetBoundMediaParams {}
 
 export interface BoundMedia {
     readonly id: string; // Derived from a hash of `streaming:<tabId>:<src>` or `local:<asbplayerId>`.
@@ -80,17 +102,13 @@ export interface BoundMedia {
     readonly active: boolean;
 }
 
-export interface GetBoundMediaResponseBody {
+export interface GetBoundMediaResult {
     readonly media: BoundMedia[];
 }
 
-export interface GetSubtitlesCommand {
-    readonly command: 'get-subtitles';
-    readonly messageId: string;
-    readonly body: {
-        mediaId?: string;
-        trackNumbers?: number[];
-    };
+export interface GetSubtitlesParams {
+    readonly mediaId?: string;
+    readonly trackNumbers?: number[];
 }
 
 export interface SubtitleCue {
@@ -100,16 +118,31 @@ export interface SubtitleCue {
     readonly track: number;
 }
 
-export interface GetSubtitlesResponseBody {
+export interface GetSubtitlesResult {
     readonly subtitles: SubtitleCue[];
 }
 
-export type ExternalCommand =
-    | MineSubtitleCommand
-    | LoadSubtitlesCommand
-    | SeekTimestampCommand
-    | GetBoundMediaCommand
-    | GetSubtitlesCommand;
+export interface MethodParams {
+    readonly initialize: InitializeParams;
+    readonly 'approval-state': Record<string, never>;
+    readonly 'mine-subtitle': MineSubtitleParams;
+    readonly 'load-subtitles': LoadSubtitlesParams;
+    readonly 'seek-timestamp': SeekTimestampParams;
+    readonly 'get-bound-media': GetBoundMediaParams;
+    readonly 'get-subtitles': GetSubtitlesParams;
+}
+
+export interface MethodResults {
+    readonly initialize: InitializeResult;
+    readonly 'approval-state': ApprovalStateResult;
+    readonly 'mine-subtitle': MineSubtitleResult;
+    readonly 'load-subtitles': Record<string, never>;
+    readonly 'seek-timestamp': Record<string, never>;
+    readonly 'get-bound-media': GetBoundMediaResult;
+    readonly 'get-subtitles': GetSubtitlesResult;
+}
+
+export type ExternalMethod = keyof MethodParams;
 
 // Post-mine actions, same values as asbplayer's PostMineAction enum.
 export const PostMineAction = {
